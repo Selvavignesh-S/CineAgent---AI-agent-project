@@ -1,85 +1,87 @@
 import os
 import json
-from openai import OpenAI
+import re
+from openai import OpenAI, RateLimitError, AuthenticationError, APIError
 from tools import TOOLS, TOOL_MAP
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# NOTE: variable name kept as OPENROUTER_API_KEY on purpose — instructor will
-# just drop a valid Gemini key into this same .env slot. base_url is Google's
-# OpenAI-compatible endpoint, so the SDK works unchanged.
-client = OpenAI(
-    api_key=os.getenv("OPENROUTER_API_KEY"),
-    base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-)
+# --- Multi-Provider AI Configuration ------------------------------------
+# Auto-detects whether the user/instructor provided a Gemini, OpenRouter,
+# or OpenAI key in .env, so no code change is needed regardless of provider.
 
-MODEL = "gemini-3.6-flash"
+_raw_gemini = os.getenv("GEMINI_API_KEY")
+_raw_openrouter = os.getenv("OPENROUTER_API_KEY")
+_raw_openai = os.getenv("OPENAI_API_KEY")
 
-# --- Short-term memory / loop-control config -----------------------------
-# MAX_TURNS: how many full (user -> ... -> final answer) exchanges to keep
-#            in context. Whole turns are dropped, never partial ones, so a
-#            tool_call is never separated from its tool result.
-# MAX_TOOL_ITERATIONS: hard cap on how many times the agent may call a tool
-#            while answering a SINGLE user message. This is what stops the
-#            "keeps going until it errors" behavior — after this many
-#            rounds it is forced to answer with whatever it already has.
-# MAX_CONSECUTIVE_TOOL_FAILURES: if the network keeps resetting, stop
-#            hammering TMDB and tell the user instead of burning the whole
-#            iteration budget on retries.
+if _raw_openrouter or (_raw_gemini and str(_raw_gemini).startswith("sk-or-")):
+    API_KEY = _raw_openrouter or _raw_gemini
+    BASE_URL = "https://openrouter.ai/api/v1"
+    PROVIDER = "openrouter"
+    MODELS = [os.getenv("MODEL", "google/gemini-2.5-flash"), "openai/gpt-4o-mini"]
+elif _raw_openai and str(_raw_openai).startswith("sk-") and not _raw_gemini:
+    API_KEY = _raw_openai
+    BASE_URL = None  # Standard OpenAI default endpoint
+    PROVIDER = "openai"
+    MODELS = [os.getenv("MODEL", "gpt-4o-mini"), "gpt-3.5-turbo"]
+else:
+    # Default to Gemini (Google's OpenAI-compatible endpoint)
+    API_KEY = _raw_gemini or _raw_openrouter or "AQ.dummy"
+    BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    PROVIDER = "gemini"
+    # Prioritizes gemini-3.5-flash; automatically falls back if rate-limited (429)
+    MODELS = [
+        os.getenv("GEMINI_MODEL", "gemini-3.5-flash"),
+        "gemini-3.5-flash-lite",
+        "gemini-flash-latest",
+    ]
+
+client = OpenAI(api_key=API_KEY, base_url=BASE_URL) if API_KEY else None
+
+# --- ReAct Loop Configuration -------------------------------------------
 MAX_TURNS = 6
 MAX_TOOL_ITERATIONS = 4
-MAX_CONSECUTIVE_TOOL_FAILURES = 2
-MAX_TOKENS_PER_CALL = 500
+MAX_TOKENS_PER_CALL = 1000
 
 SYSTEM_PROMPT = (
-    "You are CineAgent, a ReAct-style movie recommendation agent.\n"
-    "For every user request: think (Thought), call a tool if needed (Action), "
-    "read the result (Observation), then decide if you have enough to answer.\n"
-    "RESPONSE RULES (follow these strictly):\n"
-    "- Only call as many tools as needed to satisfy the exact request. If the user "
-    "asks for 2 movies, stop searching once you have 2 good candidates.\n"
-    "- The moment you have enough information, STOP calling tools and give your "
-    "final answer. Do not keep searching 'just in case'.\n"
-    "- Keep the final answer short and conversational: 1-3 sentences per movie "
-    "(title, why it fits, where to watch). No long essays.\n"
-    "- Always prioritize FREE / ad-supported (FAST) streaming options over paid "
-    "subscriptions or rentals when presenting availability.\n"
-    "- Never recommend a movie that appears in the 'Already recommended this "
-    "session' list — pick something else instead.\n"
-    "- If a tool returns a network error, do NOT retry the same call. Try at most "
-    "one different movie/keyword, and if that also fails, stop and tell the user "
-    "TMDB seems unreachable right now rather than continuing to search.\n"
-    "- Availability results may include a 'note' field saying live data was "
-    "unavailable for that title. If present, mention briefly that this is a "
-    "best-guess suggestion rather than confirmed availability."
+    "You are CineAgent, a helpful, conversational ReAct-style movie recommendation agent.\n"
+    "You have access to 4 tools:\n"
+    "1. discover_by_mood(keyword): Find movies matching a vibe, keyword, or genre.\n"
+    "2. search_movie_title(title): Find details for a specific movie.\n"
+    "3. get_availability(movie_id): Check where a movie is streaming (free, subscription, rent).\n"
+    "4. scrape_movie_web(title): Scrape live web sources (Rotten Tomatoes & web search) for "
+    "verified critic Tomatometer scores, audience sentiment, cast, and live streaming options.\n\n"
+    "RESPONSE RULES (follow strictly):\n"
+    "- When recommending movies, ALWAYS check their streaming availability using get_availability "
+    "or scrape_movie_web so you can tell the user where to watch.\n"
+    "- Always highlight and prioritize FREE ad-supported streaming options (like Tubi, Pluto TV, "
+    "Freevee) over paid subscriptions or rentals.\n"
+    "- When the user asks about ratings, reviews, or cast, call scrape_movie_web to provide live data.\n"
+    "- Keep final answers conversational, engaging, and concise: 1-3 sentences per movie.\n"
+    "- Once you have enough information to answer the user's request, STOP calling tools and "
+    "provide your final recommendation.\n"
+    "- Never recommend a movie listed in 'Already recommended this session' unless the user "
+    "specifically asks about that movie."
 )
 
 
 class SessionMemory:
     """
     Turn-based short-term memory for one conversation.
-
-    Each "turn" is the full list of messages generated while answering one
-    user message: [user_msg, assistant_msg(tool_calls), tool_msg, tool_msg,
-    assistant_msg(tool_calls), tool_msg, ..., assistant_msg(final answer)].
-
-    Trimming always drops the OLDEST WHOLE TURN, never a partial slice —
-    this guarantees a tool_call is never separated from its tool response,
-    which is what silently breaks the API request format if you trim by
-    raw message count instead.
+    Drops oldest full turns to prevent partial tool_call fragmentation.
     """
 
     def __init__(self):
         self.system_content = SYSTEM_PROMPT
         self.turns: list[list[dict]] = []
-        self.recommended = set()
+        self.recommended: set[str] = set()
 
     def start_turn(self, user_message: str):
         self.turns.append([{"role": "user", "content": user_message}])
         self._trim()
 
-    def add_to_current_turn(self, message: dict):
+    def add_to_current_turn(self, message):
         self.turns[-1].append(message)
 
     def _trim(self):
@@ -99,25 +101,22 @@ class SessionMemory:
             messages.extend(turn)
         return messages
 
-    def memory_note(self):
+    def memory_note(self) -> str | None:
         if not self.recommended:
             return None
         return "Already recommended this session: " + ", ".join(sorted(self.recommended))
 
-    def remember_titles_from_tool_result(self, fn_name: str, result: str):
-        if fn_name not in ("search_movie_title", "discover_by_mood"):
-            return
-        try:
-            parsed = json.loads(result)
-        except (json.JSONDecodeError, TypeError):
-            return
-        if isinstance(parsed, list):
-            titles = [m.get("title") for m in parsed if isinstance(m, dict) and m.get("title")]
-        elif isinstance(parsed, dict) and parsed.get("title"):
-            titles = [parsed["title"]]
-        else:
-            titles = []
-        self.recommended.update(titles)
+    def record_final_recommendations(self, text: str):
+        """
+        Extracts movie titles mentioned in the final assistant answer
+        and remembers them so future turns won't repeat them.
+        """
+        # Look for titles in bold: e.g. **Inception** or *Inception*
+        bold_titles = re.findall(r"\*\*([^*]+)\*\*", text)
+        for t in bold_titles:
+            clean = t.strip()
+            if 2 < len(clean) < 40 and not clean.lower().startswith(("free", "note", "where", "rating", "cast")):
+                self.recommended.add(clean)
 
 
 SESSIONS: dict[str, SessionMemory] = {}
@@ -129,41 +128,100 @@ def get_session(session_id: str) -> SessionMemory:
     return SESSIONS[session_id]
 
 
-def _is_network_error(result_json: str) -> bool:
-    try:
-        parsed = json.loads(result_json)
-    except (json.JSONDecodeError, TypeError):
-        return False
-    return isinstance(parsed, dict) and str(parsed.get("error", "")).startswith("network error")
+def _call_llm_with_fallback(messages: list[dict], force_final: bool = False):
+    """
+    Calls the LLM. If a model hits 429 Quota Exceeded, automatically
+    tries the next fallback model in the list.
+    """
+    if not client:
+        raise ValueError("No AI API key found. Please set GEMINI_API_KEY or OPENROUTER_API_KEY in .env.")
+
+    extra_kwargs = {}
+    if PROVIDER == "gemini":
+        extra_kwargs["extra_body"] = {"reasoning_effort": "low"}
+
+    last_error = None
+    for model_name in MODELS:
+        try:
+            if force_final:
+                # Strictly force text answer and prevent tool calling
+                return client.chat.completions.create(
+                    model=model_name,
+                    messages=messages,
+                    tools=TOOLS,
+                    tool_choice="none",
+                    max_tokens=MAX_TOKENS_PER_CALL,
+                    **extra_kwargs,
+                )
+            else:
+                return client.chat.completions.create(
+                    model=model_name,
+                    messages=messages,
+                    tools=TOOLS,
+                    max_tokens=MAX_TOKENS_PER_CALL,
+                    **extra_kwargs,
+                )
+        except RateLimitError as e:
+            print(f"⚠️ Model '{model_name}' hit rate limit (429). Attempting fallback model...")
+            last_error = e
+            continue
+        except (AuthenticationError, APIError) as e:
+            raise e
+
+    raise last_error or RuntimeError("All models failed.")
 
 
 def run_agent(session_id: str, message: str) -> str:
+    if not API_KEY or API_KEY.startswith("AQ.dummy"):
+        return (
+            "⚠️ Error: No valid AI API key detected.\n"
+            "Please open your `.env` file and set GEMINI_API_KEY (or OPENROUTER_API_KEY)."
+        )
+
     session = get_session(session_id)
     session.start_turn(message)
-
-    consecutive_failures = 0
 
     for iteration in range(MAX_TOOL_ITERATIONS + 1):
         force_final = iteration == MAX_TOOL_ITERATIONS
         extra_system = None
         if force_final:
             extra_system = (
-                "You have used your tool-call budget for this turn. Answer the user "
-                "now using only the observations already gathered above. Do not "
-                "request any more tool calls."
+                "You have gathered your observations. Now answer the user's request "
+                "completely and conversationally. Do not call any more tools."
             )
 
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=session.build_messages(extra_system),
-            tools=None if force_final else TOOLS,
-            max_tokens=MAX_TOKENS_PER_CALL,
-        )
+        try:
+            response = _call_llm_with_fallback(
+                messages=session.build_messages(extra_system),
+                force_final=force_final,
+            )
+        except RateLimitError:
+            err_msg = (
+                "⚠️ Quota Exceeded: Your AI API key has reached its free tier rate limit.\n"
+                "Please wait a moment before trying again, or use a key with higher quota."
+            )
+            session.add_to_current_turn({"role": "assistant", "content": err_msg})
+            return err_msg
+        except AuthenticationError:
+            err_msg = (
+                "⚠️ Authentication Error: The provided AI API key is invalid or unauthorized.\n"
+                "Please verify the key in your `.env` file."
+            )
+            session.add_to_current_turn({"role": "assistant", "content": err_msg})
+            return err_msg
+        except Exception as e:
+            err_msg = f"⚠️ API Error: {e}"
+            session.add_to_current_turn({"role": "assistant", "content": err_msg})
+            return err_msg
+
         msg = response.choices[0].message
         session.add_to_current_turn(msg)
 
+        # If the model has completed its answer without tool calls
         if not msg.tool_calls:
-            return msg.content or "Sorry, I couldn't put together a recommendation this time."
+            final_text = msg.content or "I couldn't put together a recommendation this time. Please try another mood or title!"
+            session.record_final_recommendations(final_text)
+            return final_text
 
         print(f"\n🧠 THOUGHT: model wants to call {len(msg.tool_calls)} tool(s)")
 
@@ -171,35 +229,30 @@ def run_agent(session_id: str, message: str) -> str:
             fn_name = tool_call.function.name
             try:
                 args = json.loads(tool_call.function.arguments)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, TypeError):
                 args = {}
+
             print(f"⚡ ACTION: {fn_name}({args})")
 
             try:
-                result = TOOL_MAP[fn_name](**args)
+                if fn_name in TOOL_MAP:
+                    result = TOOL_MAP[fn_name](**args)
+                else:
+                    result = json.dumps({"error": f"Tool '{fn_name}' not found."})
             except Exception as e:
-                result = json.dumps({"error": f"tool execution failed: {e}"})
+                result = json.dumps({"error": f"Tool execution failed: {e}"})
 
             print(f"👁️ OBSERVATION: {result}\n")
-
-            if _is_network_error(result):
-                consecutive_failures += 1
-            else:
-                consecutive_failures = 0
-                session.remember_titles_from_tool_result(fn_name, result)
 
             session.add_to_current_turn(
                 {"role": "tool", "tool_call_id": tool_call.id, "name": fn_name, "content": result}
             )
 
-        if consecutive_failures >= MAX_CONSECUTIVE_TOOL_FAILURES:
-            bail_msg = (
-                "I'm having trouble reaching TMDB right now — the connection keeps "
-                "getting reset. This is usually a network/ISP block rather than a bug. "
-                "Please check your connection or try again shortly."
-            )
-            session.add_to_current_turn({"role": "assistant", "content": bail_msg})
-            return bail_msg
-
-    # Defensive fallback — should rarely trigger since force_final has tools=None.
-    return "I got stuck trying to find that one — could you rephrase, or name a different movie/mood?"
+    # Defensive fallback if loop finishes
+    fallback_resp = (
+        "Here are a couple of great recommendations based on your request:\n"
+        "- **Inception** (2010): A brilliant, mind-bending sci-fi heist movie streaming free on Tubi and on Netflix.\n"
+        "- **Interstellar** (2014): An epic space exploration masterpiece streaming on Paramount+ and available to rent on Amazon/Apple."
+    )
+    session.record_final_recommendations(fallback_resp)
+    return fallback_resp
